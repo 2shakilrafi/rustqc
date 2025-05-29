@@ -1,0 +1,18 @@
+[package]
+name = "rustqc"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+needletail = "0.4"         # Superfast FASTQ parser
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+clap = { version = "4", features = ["derive"] }
+rayon = "1.5" 
+plotters = "0.3"
+textplots = "0.8"
+tera = "1.19.1"
+indicatif = "0.17"
+chrono = "0.4"
+whoami = "1.2"
+

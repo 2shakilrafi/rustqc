@@ -39,6 +39,8 @@ pub fn render_html(report: &Report, out_path: Option<&str>) {
 
     context.insert("datetime", &now.format("%Y-%m-%d %H:%M:%S").to_string());
     context.insert("username", &username);
+    context.insert("overrepresented_sequences", &report.overrepresented_sequences);
+
 
 
 

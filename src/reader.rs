@@ -40,6 +40,14 @@ pub fn analyze_fastq(path: &str) -> Report {
     let mut kmer_counts: HashMap<Vec<u8>, usize> = HashMap::new();
     let kmer_len = 10;
 
+    let adapters: Vec<&[u8]> = vec![
+    b"AGATCGGAAGAGC", // Illumina Universal Adapter
+    b"GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCT", // TruSeq Adapter
+    // Add more as needed
+];
+
+    let mut adapter_hits: HashMap<String, usize> = HashMap::new();
+
 
 
     while let Some(record) = reader.next() {
@@ -117,9 +125,45 @@ pub fn analyze_fastq(path: &str) -> Report {
             *kmer_counts.entry(kmer).or_insert(0) += 1;
         }
 
+        // === Adapter Detection Begins ===
+        let adapters: Vec<&[u8]> = vec![
+            b"AGATCGGAAGAGC", // Illumina Universal Adapter
+            b"GTGACTGGAGTTCAGACGTGTGCTCTTCCGATCT", // TruSeq Adapter
+            // Add more if needed
+        ];
+
+        if total_reads == 0 {
+            for adapter in &adapters {
+                adapter_hits.insert(String::from_utf8_lossy(adapter).into(), 0);
+            }
+        }
+
+        let tail_check_len = 50.min(seq.len()); // Check only the last 50 bases
+        let tail = &seq[seq.len() - tail_check_len..];
+
+        for &adapter in &adapters {
+            if tail.windows(adapter.len()).any(|w| w == adapter) {
+                let key = String::from_utf8_lossy(adapter).into_owned();
+                *adapter_hits.entry(key).or_insert(0) += 1;
+            }
+        }
+        // === Adapter Detection Ends ===
+
     }
 
+
+
     progress.finish_with_message("Done");
+
+    let adapter_content: Vec<(String, f64, usize)> = adapter_hits
+    .into_iter()
+    .map(|(adapter, count)| {
+        let pct = (count as f64 / total_reads as f64) * 100.0;
+        (adapter, pct, count)
+    })
+    .filter(|(_, pct, _)| *pct > 0.1) // filter low abundance
+    .collect();
+
 
     let mut overrepresented_sequences: Vec<(String, f64, usize)> = kmer_counts
     .into_iter()

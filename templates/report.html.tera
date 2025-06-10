@@ -165,6 +165,33 @@
         <small>Percentage of ambiguous bases (N) per position.</small>
     </div>
 
+    <div class="plot-container">
+      <h2 id="overrep">Overrepresented Sequences</h2>
+      {% if overrepresented_sequences | length > 0 %}
+        <table>
+          <thead>
+            <tr>
+              <th>Sequence</th>
+              <th>Percentage of Reads</th>
+              <th>Count</th>
+            </tr>
+          </thead>
+          <tbody>
+            {% for seq in overrepresented_sequences %}
+            <tr>
+              <td><code>{{ seq.0 }}</code></td>
+              <td>{{ seq.1 | round(floor=2) }}%</td>
+              <td>{{ seq.2 }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        <small>Sequences appearing in more than 0.1% of total reads.</small>
+      {% else %}
+        <p>No overrepresented sequences detected.</p>
+      {% endif %}
+    </div>
+
 
 </main>
 
@@ -179,6 +206,7 @@
     <li><a href="#base-composition">Base Composition</a></li>
     <li><a href="#per-seq-qual">Per-Sequence Quality</a></li>
     <li><a href="#n-content">Per-Base N Content</a></li>
+    <li><a href="#overrep">Overrepresented Sequences</a></li>
   </ul>
 </nav>
 

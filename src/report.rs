@@ -20,7 +20,6 @@ pub struct Report {
     pub percent_g: Vec<f64>,
     pub percent_c: Vec<f64>,
 
-    // ✅ NEW: avg quality per read histogram
     pub per_sequence_quality_histogram: HashMap<u8, usize>,
     pub n_content: Vec<f64>, // ← NEW
     pub overrepresented_sequences: Vec<(String, f64, usize)>,

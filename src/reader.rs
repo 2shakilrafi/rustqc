@@ -37,6 +37,10 @@ pub fn analyze_fastq(path: &str) -> Report {
 
     let mut n_content_counts: Vec<usize> = Vec::new();
 
+    let mut kmer_counts: HashMap<Vec<u8>, usize> = HashMap::new();
+    let kmer_len = 10;
+
+
 
     while let Some(record) = reader.next() {
         let seqrec = record.expect("Invalid FASTQ record");
@@ -107,9 +111,28 @@ pub fn analyze_fastq(path: &str) -> Report {
         // Best effort progress estimation
         let estimated_bytes = (total_bases as f64 * 1.5) as u64;
         progress.set_position(estimated_bytes.min(file_size));
+
+        if seq.len() >= kmer_len {
+            let kmer = seq[..kmer_len].to_vec();
+            *kmer_counts.entry(kmer).or_insert(0) += 1;
+        }
+
     }
 
     progress.finish_with_message("Done");
+
+    let mut overrepresented_sequences: Vec<(String, f64, usize)> = kmer_counts
+    .into_iter()
+    .map(|(kmer, count)| {
+        let kmer_str = String::from_utf8_lossy(&kmer).into_owned();
+        let percentage = (count as f64 / total_reads as f64) * 100.0;
+        (kmer_str, percentage, count)
+    })
+    .filter(|(_, pct, _)| *pct > 0.1) // Only keep kmers that show up in >0.1% of reads
+    .collect();
+
+    overrepresented_sequences.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+
 
     let avg_length = total_bases as f64 / total_reads as f64;
     let mode_length = length_counts
@@ -158,5 +181,6 @@ pub fn analyze_fastq(path: &str) -> Report {
         percent_c,
         per_sequence_quality_histogram,
         n_content,
+        overrepresented_sequences,
     }
 }

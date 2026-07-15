@@ -1,1 +1,15 @@
 test.fastq
+test-4.fastq
+test-4.fastq.gz
+/target/
+qc-results/
+.DS_Store
+*-rustqc-vs-fastqc.json
+rustqc-vs-fastqc.json
+*_rustqc.html
+*_rustqc.json
+*_rustqc.zip
+*_fastqc.html
+*_fastqc.zip
+*_fastqc_data.txt
+*_summary.txt

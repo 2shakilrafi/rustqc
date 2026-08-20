@@ -9,9 +9,11 @@ use crate::report::{
     CountPoint, DuplicationData, DuplicationPoint, GcContentData, GcPoint, Module,
     OverrepresentedSequence, PositionValue, Report, SequenceQualityData, Status, TileQualityData,
 };
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use crossbeam_channel::{Receiver, Sender, TrySendError, bounded};
 use indicatif::{ProgressBar, ProgressStyle};
 use needletail::{FastxReader, parse_fastx_reader, parse_fastx_stdin};
+use smallvec::SmallVec;
 use std::collections::{BTreeMap, HashMap};
 use std::fs::File;
 use std::io::Read;
@@ -24,7 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 const QUALITY_MIN_ASCII: usize = 33;
 const QUALITY_MAX_ASCII: usize = 126;
 const QUALITY_BINS: usize = QUALITY_MAX_ASCII - QUALITY_MIN_ASCII + 1;
-const RECORDS_PER_BATCH: usize = 4_096;
+const RECORDS_PER_BATCH: usize = 8_192;
 
 #[derive(Clone)]
 pub struct AnalysisConfig {
@@ -35,6 +37,38 @@ pub struct AnalysisConfig {
     pub phred_offset: PhredOffset,
     pub adapters: Vec<NamedSequence>,
     pub contaminants: Vec<NamedSequence>,
+    adapter_matcher: Option<AhoCorasick>,
+}
+
+impl AnalysisConfig {
+    pub fn new(
+        no_group: bool,
+        nofilter: bool,
+        dup_length: usize,
+        min_length: usize,
+        phred_offset: PhredOffset,
+        adapters: Vec<NamedSequence>,
+        contaminants: Vec<NamedSequence>,
+    ) -> Result<Self, String> {
+        let adapter_matcher = (!adapters.is_empty())
+            .then(|| {
+                AhoCorasickBuilder::new()
+                    .ascii_case_insensitive(true)
+                    .build(adapters.iter().map(|adapter| adapter.sequence.as_slice()))
+                    .map_err(|error| format!("failed to build adapter matcher: {error}"))
+            })
+            .transpose()?;
+        Ok(Self {
+            no_group,
+            nofilter,
+            dup_length,
+            min_length,
+            phred_offset,
+            adapters,
+            contaminants,
+            adapter_matcher,
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -75,24 +109,40 @@ impl<R: Read> Read for CountingReader<R> {
     }
 }
 
-struct OwnedRecord {
-    id: Vec<u8>,
-    sequence: Vec<u8>,
-    quality: Option<Vec<u8>>,
+#[derive(Clone, Copy)]
+struct ByteRange {
+    start: usize,
+    end: usize,
+}
+
+impl ByteRange {
+    #[inline]
+    fn slice(self, bytes: &[u8]) -> &[u8] {
+        &bytes[self.start..self.end]
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PackedRecord {
+    id: ByteRange,
+    sequence: ByteRange,
+    quality: Option<ByteRange>,
 }
 
 struct WorkBatch {
     index: usize,
-    records: Vec<OwnedRecord>,
+    bytes: Vec<u8>,
+    records: Vec<PackedRecord>,
 }
 
 struct OrderedRecord {
-    duplicate_prefix: Vec<u8>,
-    tile: Option<(Option<u32>, Vec<u8>)>,
+    duplicate_prefix: SmallVec<[u8; 64]>,
+    tile: Option<(Option<u32>, ByteRange)>,
 }
 
 struct BatchResult {
     index: usize,
+    bytes: Vec<u8>,
     accumulator: Accumulator,
     ordered_records: Vec<OrderedRecord>,
 }
@@ -196,10 +246,6 @@ impl Accumulator {
     ) -> Result<bool, String> {
         self.total_sequences += 1;
         self.total_bases += sequence.len() as u64;
-        self.total_gc += sequence
-            .iter()
-            .filter(|base| matches!(base.to_ascii_uppercase(), b'G' | b'C'))
-            .count() as u64;
         self.min_length = self.min_length.min(sequence.len());
         self.max_length = self.max_length.max(sequence.len());
         *self.length_counts.entry(sequence.len()).or_default() += 1;
@@ -209,6 +255,7 @@ impl Accumulator {
             self.poor_quality_sequences += 1;
         }
         if poor_quality && !config.nofilter {
+            self.total_gc += count_gc(sequence);
             return Ok(false);
         }
         self.analyzed_sequences += 1;
@@ -218,26 +265,22 @@ impl Accumulator {
                 .resize_with(sequence.len(), PositionAccumulator::default);
         }
 
-        let mut gc_count = 0usize;
+        let model_length = gc_model_length(sequence.len());
+        let mut total_gc = 0u64;
+        let mut model_gc = 0usize;
         for (index, raw_base) in sequence.iter().copied().enumerate() {
-            let base = raw_base.to_ascii_uppercase();
-            let slot = match base {
-                b'A' => 0,
-                b'C' => {
-                    gc_count += 1;
-                    1
+            let (slot, is_gc) = base_slot(raw_base);
+            if is_gc {
+                total_gc += 1;
+                if index < model_length {
+                    model_gc += 1;
                 }
-                b'G' => {
-                    gc_count += 1;
-                    2
-                }
-                b'T' | b'U' => 3,
-                _ => 4,
-            };
+            }
             self.positions[index].bases[slot] += 1;
         }
-        self.add_gc_observation(sequence, gc_count);
-        self.add_adapter_observations(sequence, &config.adapters);
+        self.total_gc += total_gc;
+        self.add_gc_observation(model_length, model_gc);
+        self.add_adapter_observations(sequence, config.adapter_matcher.as_ref());
 
         if let Some(quality) = quality {
             if quality.len() != sequence.len() {
@@ -272,25 +315,10 @@ impl Accumulator {
         Ok(true)
     }
 
-    fn add_gc_observation(&mut self, sequence: &[u8], full_gc_count: usize) {
-        if sequence.is_empty() {
+    fn add_gc_observation(&mut self, model_length: usize, gc_count: usize) {
+        if model_length == 0 {
             return;
         }
-        let model_length = if sequence.len() > 1000 {
-            (sequence.len() / 1000) * 1000
-        } else if sequence.len() > 100 {
-            (sequence.len() / 100) * 100
-        } else {
-            sequence.len()
-        };
-        let gc_count = if model_length == sequence.len() {
-            full_gc_count
-        } else {
-            sequence[..model_length]
-                .iter()
-                .filter(|base| matches!(base.to_ascii_uppercase(), b'G' | b'C'))
-                .count()
-        };
         let claims = self
             .gc_claim_cache
             .entry(model_length)
@@ -312,18 +340,19 @@ impl Accumulator {
             return;
         }
         if prefix.iter().any(u8::is_ascii_lowercase) {
-            self.add_duplication_prefix(prefix.to_ascii_uppercase());
+            let normalized = uppercase_prefix(prefix);
+            self.add_duplication_prefix(normalized.as_slice());
         } else {
-            self.add_duplication_prefix(prefix.to_vec());
+            self.add_duplication_prefix(prefix);
         }
     }
 
-    fn add_duplication_prefix(&mut self, prefix: Vec<u8>) {
+    fn add_duplication_prefix(&mut self, prefix: &[u8]) {
         self.add_duplication_prefix_at(prefix, self.analyzed_sequences);
     }
 
-    fn add_duplication_prefix_at(&mut self, prefix: Vec<u8>, analyzed_position: u64) {
-        if let Some(count) = self.sequence_counts.get_mut(prefix.as_slice()) {
+    fn add_duplication_prefix_at(&mut self, prefix: &[u8], analyzed_position: u64) {
+        if let Some(count) = self.sequence_counts.get_mut(prefix) {
             *count += 1;
             if !self.duplication_frozen {
                 self.count_at_unique_limit = analyzed_position;
@@ -331,7 +360,7 @@ impl Accumulator {
             return;
         }
         if !self.duplication_frozen {
-            self.sequence_counts.insert(prefix, 1);
+            self.sequence_counts.insert(prefix.to_vec(), 1);
             self.count_at_unique_limit = analyzed_position;
             if self.sequence_counts.len() == MAX_TRACKED_UNIQUE_SEQUENCES {
                 self.duplication_frozen = true;
@@ -371,9 +400,22 @@ impl Accumulator {
         }
     }
 
-    fn add_adapter_observations(&mut self, sequence: &[u8], adapters: &[NamedSequence]) {
-        for (adapter_index, adapter) in adapters.iter().enumerate() {
-            if let Some(position) = find_subslice_case_insensitive(sequence, &adapter.sequence) {
+    fn add_adapter_observations(&mut self, sequence: &[u8], matcher: Option<&AhoCorasick>) {
+        let Some(matcher) = matcher else {
+            return;
+        };
+        // A single overlapping multi-pattern scan preserves the first hit for
+        // every adapter, including adapters that overlap one another.
+        let mut first_positions =
+            SmallVec::<[usize; 16]>::from_elem(usize::MAX, matcher.patterns_len());
+        for found in matcher.find_overlapping_iter(sequence) {
+            let adapter_index = found.pattern().as_usize();
+            if first_positions[adapter_index] == usize::MAX {
+                first_positions[adapter_index] = found.start();
+            }
+        }
+        for (adapter_index, position) in first_positions.into_iter().enumerate() {
+            if position != usize::MAX {
                 let starts = &mut self.adapter_starts[adapter_index];
                 if starts.len() <= position {
                     starts.resize(position + 1, 0);
@@ -588,6 +630,7 @@ fn consume_reader_parallel(
         let mut batch_index = 0usize;
         'read: loop {
             let mut records = Vec::with_capacity(RECORDS_PER_BATCH);
+            let mut bytes = Vec::with_capacity(RECORDS_PER_BATCH * 512);
             let mut reached_eof = false;
             while records.len() < RECORDS_PER_BATCH {
                 let Some(record) = reader.next() else {
@@ -597,10 +640,10 @@ fn consume_reader_parallel(
                 match record {
                     Ok(record) => {
                         let sequence = record.seq();
-                        records.push(OwnedRecord {
-                            id: record.id().to_vec(),
-                            sequence: sequence.into_owned(),
-                            quality: record.qual().map(ToOwned::to_owned),
+                        records.push(PackedRecord {
+                            id: pack_bytes(&mut bytes, record.id()),
+                            sequence: pack_bytes(&mut bytes, sequence.as_ref()),
+                            quality: record.qual().map(|quality| pack_bytes(&mut bytes, quality)),
                         });
                     }
                     Err(error) => {
@@ -613,6 +656,7 @@ fn consume_reader_parallel(
                 if let Err(error) = send_batch(
                     WorkBatch {
                         index: batch_index,
+                        bytes,
                         records,
                     },
                     &work_tx,
@@ -683,29 +727,35 @@ fn process_batch(
     config: &AnalysisConfig,
     filename: &str,
 ) -> Result<BatchResult, String> {
+    let WorkBatch {
+        index,
+        bytes,
+        records,
+    } = batch;
     let mut accumulator = Accumulator::batch(filename.to_string(), config.adapters.len());
-    let mut ordered_records = Vec::with_capacity(batch.records.len());
-    for OwnedRecord {
-        id,
-        sequence,
-        quality,
-    } in batch.records
-    {
-        if !accumulator.process_reducible_record(&id, &sequence, quality.as_deref(), config)? {
+    let mut ordered_records = Vec::with_capacity(records.len());
+    for record in records {
+        let id = record.id.slice(&bytes);
+        let sequence = record.sequence.slice(&bytes);
+        let quality = record.quality.map(|range| range.slice(&bytes));
+        if !accumulator.process_reducible_record(id, sequence, quality, config)? {
             continue;
         }
-        let duplicate_prefix =
-            sequence[..sequence.len().min(config.dup_length)].to_ascii_uppercase();
-        let tile = quality
-            .filter(|quality| !quality.is_empty())
-            .map(|quality| (parse_tile(&id), quality));
+        let duplicate_prefix = uppercase_prefix(&sequence[..sequence.len().min(config.dup_length)]);
+        let tile = quality.filter(|quality| !quality.is_empty()).map(|_| {
+            (
+                parse_tile(id),
+                record.quality.expect("quality range should exist"),
+            )
+        });
         ordered_records.push(OrderedRecord {
             duplicate_prefix,
             tile,
         });
     }
     Ok(BatchResult {
-        index: batch.index,
+        index,
+        bytes,
         accumulator,
         ordered_records,
     })
@@ -789,14 +839,32 @@ fn accept_batch_result(
 }
 
 fn merge_batch_result(accumulator: &mut Accumulator, result: BatchResult) {
+    let BatchResult {
+        bytes,
+        accumulator: partial,
+        ordered_records,
+        ..
+    } = result;
     let analyzed_before = accumulator.analyzed_sequences;
-    accumulator.merge_reducible(result.accumulator);
-    for (index, record) in result.ordered_records.into_iter().enumerate() {
-        accumulator
-            .add_duplication_prefix_at(record.duplicate_prefix, analyzed_before + index as u64 + 1);
+    accumulator.merge_reducible(partial);
+    for (index, record) in ordered_records.into_iter().enumerate() {
+        accumulator.add_duplication_prefix_at(
+            record.duplicate_prefix.as_slice(),
+            analyzed_before + index as u64 + 1,
+        );
         if let Some((tile, quality)) = record.tile {
-            accumulator.add_tile_observation_for_tile(tile, &quality);
+            accumulator.add_tile_observation_for_tile(tile, quality.slice(&bytes));
         }
+    }
+}
+
+#[inline]
+fn pack_bytes(bytes: &mut Vec<u8>, value: &[u8]) -> ByteRange {
+    let start = bytes.len();
+    bytes.extend_from_slice(value);
+    ByteRange {
+        start,
+        end: bytes.len(),
     }
 }
 
@@ -1496,16 +1564,39 @@ fn gc_percentage_range(gc_count: usize, length: usize) -> (usize, usize) {
     (low.min(100), high.min(100))
 }
 
-fn find_subslice_case_insensitive(sequence: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || sequence.len() < needle.len() {
-        return None;
+#[inline]
+fn base_slot(base: u8) -> (usize, bool) {
+    match base {
+        b'A' | b'a' => (0, false),
+        b'C' | b'c' => (1, true),
+        b'G' | b'g' => (2, true),
+        b'T' | b't' | b'U' | b'u' => (3, false),
+        _ => (4, false),
     }
-    sequence.windows(needle.len()).position(|window| {
-        window
-            .iter()
-            .zip(needle)
-            .all(|(left, right)| left.to_ascii_uppercase() == *right)
-    })
+}
+
+#[inline]
+fn gc_model_length(length: usize) -> usize {
+    if length > 1_000 {
+        (length / 1_000) * 1_000
+    } else if length > 100 {
+        (length / 100) * 100
+    } else {
+        length
+    }
+}
+
+#[inline]
+fn count_gc(sequence: &[u8]) -> u64 {
+    sequence
+        .iter()
+        .filter(|base| matches!(base, b'G' | b'g' | b'C' | b'c'))
+        .count() as u64
+}
+
+#[inline]
+fn uppercase_prefix(prefix: &[u8]) -> SmallVec<[u8; 64]> {
+    prefix.iter().map(u8::to_ascii_uppercase).collect()
 }
 
 fn is_casava_filtered(id: &[u8]) -> bool {
@@ -1516,19 +1607,48 @@ fn is_casava_filtered(id: &[u8]) -> bool {
 }
 
 fn parse_tile(id: &[u8]) -> Option<u32> {
-    let first_field = id
-        .split(|byte| byte.is_ascii_whitespace())
-        .next()
-        .unwrap_or(id);
-    let fields: Vec<_> = first_field.split(|byte| *byte == b':').collect();
-    let tile = if fields.len() >= 7 {
-        fields.get(4)?
-    } else if fields.len() >= 5 {
-        fields.get(2)?
+    let first_field_end = id
+        .iter()
+        .position(u8::is_ascii_whitespace)
+        .unwrap_or(id.len());
+    let first_field = &id[..first_field_end];
+    let mut field_start = 0;
+    let mut field_count = 0;
+    let mut legacy_tile = None;
+    let mut modern_tile = None;
+
+    for index in 0..=first_field.len() {
+        if index == first_field.len() || first_field[index] == b':' {
+            let field = &first_field[field_start..index];
+            if field_count == 2 {
+                legacy_tile = Some(field);
+            } else if field_count == 4 {
+                modern_tile = Some(field);
+            }
+            field_count += 1;
+            field_start = index + 1;
+        }
+    }
+
+    let tile = if field_count >= 7 {
+        modern_tile?
+    } else if field_count >= 5 {
+        legacy_tile?
     } else {
         return None;
     };
-    std::str::from_utf8(tile).ok()?.parse().ok()
+    parse_ascii_u32(tile)
+}
+
+#[inline]
+fn parse_ascii_u32(value: &[u8]) -> Option<u32> {
+    value.iter().copied().try_fold(0u32, |number, byte| {
+        if byte.is_ascii_digit() {
+            number.checked_mul(10)?.checked_add((byte - b'0') as u32)
+        } else {
+            None
+        }
+    })
 }
 
 fn input_filename(input: &str) -> String {
@@ -1583,6 +1703,97 @@ mod tests {
     }
 
     #[test]
+    fn combined_adapter_matcher_preserves_overlapping_first_hits() {
+        let config = AnalysisConfig::new(
+            false,
+            false,
+            50,
+            0,
+            PhredOffset::Phred33,
+            vec![
+                NamedSequence {
+                    name: "adapter-a".into(),
+                    sequence: b"ACGT".to_vec(),
+                },
+                NamedSequence {
+                    name: "adapter-b".into(),
+                    sequence: b"CGTAC".to_vec(),
+                },
+            ],
+            Vec::new(),
+        )
+        .expect("adapters should compile");
+        let mut accumulator = Accumulator::new("fixture.fastq".into(), config.adapters.len());
+        accumulator.add_adapter_observations(b"ttacgtacgg", config.adapter_matcher.as_ref());
+
+        assert_eq!(accumulator.adapter_starts[0], vec![0, 0, 1]);
+        assert_eq!(accumulator.adapter_starts[1], vec![0, 0, 0, 1]);
+    }
+
+    #[test]
+    fn gzip_input_matches_plain_fastq() {
+        use flate2::{Compression, write::GzEncoder};
+        use std::io::Write;
+
+        let directory = std::env::temp_dir().join(format!(
+            "rustqc-gzip-input-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock should be valid")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).expect("fixture directory should be writable");
+        let plain_path = directory.join("fixture.fastq");
+        let gzip_path = directory.join("fixture.fastq.gz");
+        let fastq = b"@K00271:89:HHWWNBBXX:2:1101:9749:1 1:N:0:A\nACGTACGT\n+\nIIIIIIII\n@K00271:89:HHWWNBBXX:2:1101:9749:2 1:N:0:A\nGGGGTTTT\n+\nIIIIIIII\n";
+        std::fs::write(&plain_path, fastq).expect("plain fixture should be writable");
+        let gzip_file = File::create(&gzip_path).expect("gzip fixture should be writable");
+        let mut encoder = GzEncoder::new(gzip_file, Compression::default());
+        encoder
+            .write_all(fastq)
+            .expect("fixture should be compressible");
+        encoder.finish().expect("gzip fixture should finalize");
+
+        let config = AnalysisConfig::new(
+            false,
+            false,
+            50,
+            0,
+            PhredOffset::Phred33,
+            crate::metrics::default_adapters(),
+            crate::metrics::default_contaminants(),
+        )
+        .expect("default adapters should compile");
+        let plain = analyze_input(plain_path.to_str().expect("utf-8 path"), &config)
+            .expect("plain analysis should succeed");
+        let gzip = analyze_input(gzip_path.to_str().expect("utf-8 path"), &config)
+            .expect("gzip analysis should succeed");
+
+        assert_eq!(
+            plain.basic_statistics.data.total_sequences,
+            gzip.basic_statistics.data.total_sequences
+        );
+        assert_eq!(
+            plain.basic_statistics.data.total_bases,
+            gzip.basic_statistics.data.total_bases
+        );
+        assert_eq!(
+            plain.per_tile_sequence_quality.data.tiles,
+            gzip.per_tile_sequence_quality.data.tiles
+        );
+        assert_eq!(
+            plain.adapter_content.data.positions,
+            gzip.adapter_content.data.positions
+        );
+        assert_eq!(
+            plain.sequence_duplication_levels.status,
+            gzip.sequence_duplication_levels.status
+        );
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
     fn parallel_batches_preserve_order_sensitive_statistics() {
         let path = std::env::temp_dir().join(format!(
             "rustqc-parallel-{}-{}.fastq",
@@ -1604,15 +1815,16 @@ mod tests {
             ));
         }
         std::fs::write(&path, fastq).expect("fixture should be writable");
-        let config = AnalysisConfig {
-            no_group: false,
-            nofilter: false,
-            dup_length: 50,
-            min_length: 0,
-            phred_offset: PhredOffset::Phred33,
-            adapters: crate::metrics::default_adapters(),
-            contaminants: crate::metrics::default_contaminants(),
-        };
+        let config = AnalysisConfig::new(
+            false,
+            false,
+            50,
+            0,
+            PhredOffset::Phred33,
+            crate::metrics::default_adapters(),
+            crate::metrics::default_contaminants(),
+        )
+        .expect("default adapters should compile");
         let sequential = analyze_input(path.to_str().expect("utf-8 path"), &config)
             .expect("sequential analysis should succeed");
         let parallel =

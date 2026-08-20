@@ -28,8 +28,16 @@ pub fn write_artifacts(report: &Report, args: &Args) -> Result<Vec<PathBuf>, Str
     let html_report = matches!(args.format, OutputFormat::Html | OutputFormat::All)
         .then(|| html::render_html(report))
         .transpose()?;
-    let summary = render_summary(report);
-    let data = render_fastqc_data(report);
+    // FastQC-compatible text is only needed for a ZIP, text output, or extraction.
+    // Skipping it avoids materializing a second full report for HTML-only invocations.
+    let needs_compatibility_data = (!args.nozip && html_report.is_some())
+        || matches!(args.format, OutputFormat::Text | OutputFormat::All)
+        || args.extract;
+    let (summary, data) = if needs_compatibility_data {
+        (render_summary(report), render_fastqc_data(report))
+    } else {
+        (String::new(), String::new())
+    };
 
     if let Some(html) = &html_report {
         let path = args.outdir.join(format!("{stem}_rustqc.html"));

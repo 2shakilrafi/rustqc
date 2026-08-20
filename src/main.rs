@@ -33,15 +33,15 @@ fn run() -> Result<(), String> {
         .map(load_named_sequences)
         .transpose()?
         .unwrap_or_else(default_contaminants);
-    let config = AnalysisConfig {
-        no_group: args.no_group,
-        nofilter: args.nofilter,
-        dup_length: args.dup_length,
-        min_length: args.min_length,
-        phred_offset: args.phred_offset,
+    let config = AnalysisConfig::new(
+        args.no_group,
+        args.nofilter,
+        args.dup_length,
+        args.min_length,
+        args.phred_offset,
         adapters,
         contaminants,
-    };
+    )?;
     let threads = if args.threads == 0 {
         std::thread::available_parallelism()
             .map(usize::from)

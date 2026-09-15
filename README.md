@@ -1,6 +1,6 @@
 # RustQC
 
-RustQC 0.3.6 is a fast, memory-bounded command-line quality-control analyzer for FASTQ and FASTA data. It implements the eleven active FastQC 0.12.1 analysis modules and emits self-contained reports plus FastQC-compatible data artifacts.
+RustQC 0.4.0 is a fast, memory-bounded command-line quality-control analyzer for FASTQ and FASTA data. It implements the eleven active FastQC 0.12.1 analysis modules and emits self-contained reports plus FastQC-compatible data artifacts.
 
 ## Analysis modules
 
@@ -32,9 +32,31 @@ The default warn/fail thresholds and position grouping match FastQC 0.12.1. FAST
 
 Memory grows with the longest observed read, capped duplication state, and sampled tile state rather than the total number of reads.
 
-## Build
+## Installation
+
+### Conda
+
+Once the RustQC recipe is published by conda-forge, install it with:
 
 ```bash
+conda install -c conda-forge rustqc
+```
+
+The same package can be installed with compatible clients such as `mamba` or `micromamba`.
+
+### Cargo
+
+Install the current release directly from GitHub:
+
+```bash
+cargo install --locked --git https://github.com/2shakilrafi/rustqc.git --tag v0.4.0
+```
+
+### Build from source
+
+```bash
+git clone https://github.com/2shakilrafi/rustqc.git
+cd rustqc
 cargo build --release
 ```
 
@@ -112,3 +134,17 @@ For a local performance sample with macOS peak-memory reporting:
 ```
 
 RustQC is CLI-first and does not reproduce FastQC's Swing desktop interface. Its parity target is FastQC 0.12.1's active sequence-QC modules and pipeline report artifacts.
+
+## Conda package maintenance
+
+The conda-forge-compatible recipe is stored in `conda/recipe.yaml`. To build and run its package tests locally with [rattler-build](https://rattler.build/):
+
+```bash
+rattler-build build --recipe conda/recipe.yaml --channel conda-forge
+```
+
+Release recipes use the immutable GitHub tag archive and its SHA-256 checksum. Update the version, source checksum, and build number together for each release.
+
+## License
+
+RustQC is released under the permissive [MIT License](LICENSE).

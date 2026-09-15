@@ -39,3 +39,24 @@ fn analyzes_fastq_and_writes_structured_report() {
 
     let _ = fs::remove_file(output);
 }
+
+#[test]
+fn html_nozip_writes_only_the_requested_report() {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let input = manifest.join("tests/fixtures/tiny.fastq");
+    let output = std::env::temp_dir().join(format!("rustqc-html-{}", std::process::id()));
+
+    let status = Command::new(env!("CARGO_BIN_EXE_rustqc"))
+        .args(["--quiet", "--format", "html", "--nozip", "--outdir"])
+        .arg(&output)
+        .arg(&input)
+        .status()
+        .expect("rustqc should launch");
+    assert!(status.success());
+    assert!(output.join("tiny_rustqc.html").is_file());
+    assert!(!output.join("tiny_rustqc.zip").exists());
+    assert!(!output.join("tiny_fastqc_data.txt").exists());
+    assert!(!output.join("tiny_summary.txt").exists());
+
+    let _ = fs::remove_dir_all(output);
+}

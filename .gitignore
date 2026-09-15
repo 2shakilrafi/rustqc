@@ -13,3 +13,5 @@ rustqc-vs-fastqc.json
 *_fastqc.zip
 *_fastqc_data.txt
 *_summary.txt
+/100gb.fastq
+/synthetic_*.fastq

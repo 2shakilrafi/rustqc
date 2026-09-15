@@ -6,7 +6,8 @@ package:
   version: ${{ version }}
 
 source:
-  path: ..
+  url: https://github.com/2shakilrafi/rustqc/archive/refs/tags/v${{ version }}.tar.gz
+  sha256: 023160deb277e03b5cebe4bfbc7b3797b0e96ec383dec535c3127c999793a0a6
 
 build:
   number: 0

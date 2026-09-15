@@ -39,10 +39,13 @@ Memory grows with the longest observed read, capped duplication state, and sampl
 Once the RustQC recipe is published by conda-forge, install it with:
 
 ```bash
-conda install -c conda-forge rustqc
+conda install -c conda-forge rustqc-fastq
 ```
 
-The same package can be installed with compatible clients such as `mamba` or `micromamba`.
+The installed command is still `rustqc`. The conda distribution uses the name
+`rustqc-fastq` because an unrelated project already publishes a `rustqc` package
+through Bioconda. The same package can be installed with compatible clients such
+as `mamba` or `micromamba`.
 
 ### Cargo
 
